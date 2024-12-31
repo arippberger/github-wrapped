@@ -1,5 +1,6 @@
 import { Octokit } from "@octokit/rest";
-import { LRUCache } from 'lru-cache';
+import { graphql } from "@octokit/graphql";
+import { LRUCache } from "lru-cache";
 
 // Cache configuration
 const cache = new LRUCache({
@@ -17,7 +18,9 @@ async function rateLimit() {
   const now = Date.now();
   const timeSinceLastCall = now - rateLimiter.lastCall;
   if (timeSinceLastCall < rateLimiter.minInterval) {
-    await new Promise(resolve => setTimeout(resolve, rateLimiter.minInterval - timeSinceLastCall));
+    await new Promise((resolve) =>
+      setTimeout(resolve, rateLimiter.minInterval - timeSinceLastCall)
+    );
   }
   rateLimiter.lastCall = Date.now();
 }
@@ -30,6 +33,62 @@ export interface RepoStats {
   description: string | null;
   language: string | null;
   contributions: number;
+  isPrivate: boolean;
+}
+
+async function getAllRepositories(graphqlWithAuth: any, login: string) {
+  const repositories = [];
+  let hasNextPage = true;
+  let cursor = null;
+
+  while (hasNextPage) {
+    const { user } = await graphqlWithAuth(
+      `
+      query getRepositories($cursor: String) {
+        user(login: "${login}") {
+          repositories(
+            first: 100,
+            after: $cursor,
+            orderBy: {field: UPDATED_AT, direction: DESC},
+            ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER],
+            affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]
+          ) {
+            nodes {
+              nameWithOwner
+              isPrivate
+              url
+              description
+              primaryLanguage {
+                name
+              }
+              stargazerCount
+              defaultBranchRef {
+                target {
+                  ... on Commit {
+                    history(first: 0) {
+                      totalCount
+                    }
+                  }
+                }
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      }
+    `,
+      { cursor }
+    );
+
+    repositories.push(...user.repositories.nodes);
+    hasNextPage = user.repositories.pageInfo.hasNextPage;
+    cursor = user.repositories.pageInfo.endCursor;
+  }
+
+  return repositories;
 }
 
 export async function getGitHubStats(accessToken: string | undefined | null) {
@@ -47,167 +106,169 @@ export async function getGitHubStats(accessToken: string | undefined | null) {
   const octokit = new Octokit({
     auth: accessToken,
   });
-  
+
   try {
     await rateLimit(); // Apply rate limiting
-    // Get user's repositories
-    const { data: repos } = await octokit.repos.listForAuthenticatedUser({
-      sort: "pushed",
-      per_page: 100,
-      type: "owner",
+
+    // Create a GraphQL client
+    const graphqlWithAuth = graphql.defaults({
+      headers: {
+        authorization: `token ${accessToken}`,
+      },
     });
 
-    const repoStats: RepoStats[] = [];
-    let totalComments = 0;
-    let totalReviews = 0;
-    const activeDaysSet = new Set<string>();
-    const dailyContributions: Record<string, number> = {};
-
-    // Get commit counts and other stats for each repository
-    for (const repo of repos) {
-      // Skip forked repositories
-      if (repo.fork) {
-        continue;
-      }
-
-      try {
-        // Get commit activity stats
-        const { data: commitActivity } = await octokit.repos.getCommitActivityStats({
-          owner: repo.owner.login,
-          repo: repo.name,
-        });
-
-        let totalCommits = 0;
-        
-        // If we have commit activity data, sum it up
-        if (Array.isArray(commitActivity)) {
-          totalCommits = commitActivity.reduce((sum, week) => sum + (week.total || 0), 0);
-          // Record daily commits for the current year
-          commitActivity.forEach(week => {
-            const weekStart = new Date(week.week * 1000);
-            if (weekStart.getFullYear() === new Date().getFullYear()) {
-              week.days.forEach((count, dayIndex) => {
-                if (count > 0) {
-                  const date = new Date(week.week * 1000);
-                  date.setDate(date.getDate() + dayIndex);
-                  const dayKey = date.toLocaleDateString('en-US', { weekday: 'long' });
-                  activeDaysSet.add(date.toISOString());
-                  dailyContributions[dayKey] = (dailyContributions[dayKey] || 0) + count;
+    // Get user's contributions data using GraphQL
+    const { user } = await graphqlWithAuth(`
+      query {
+        user(login: "${(await octokit.users.getAuthenticated()).data.login}") {
+          contributionsCollection {
+            totalCommitContributions
+            totalIssueContributions
+            totalPullRequestContributions
+            totalPullRequestReviewContributions
+            commitContributionsByRepository(maxRepositories: 100) {
+              repository {
+                nameWithOwner
+                isPrivate
+                url
+                description
+                primaryLanguage {
+                  name
                 }
-              });
-            }
-          });
-        }
-
-        // Get comments for this repo
-        const { data: comments } = await octokit.issues.listCommentsForRepo({
-          owner: repo.owner.login,
-          repo: repo.name,
-          since: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString(), // Last year
-          per_page: 100,
-        });
-        totalComments += comments.length;
-
-        // Record comment dates for active days
-        comments.forEach(comment => {
-          if (comment.created_at) {
-            const date = new Date(comment.created_at);
-            if (date.getFullYear() === new Date().getFullYear()) {
-              const dayKey = date.toLocaleDateString('en-US', { weekday: 'long' });
-              activeDaysSet.add(date.toISOString());
-              dailyContributions[dayKey] = (dailyContributions[dayKey] || 0) + 1;
-            }
-          }
-        });
-
-        // Get PR reviews for this repo
-        const { data: pullRequests } = await octokit.pulls.list({
-          owner: repo.owner.login,
-          repo: repo.name,
-          state: "all",
-          per_page: 100,
-        });
-
-        // For each PR, get its reviews
-        for (const pr of pullRequests) {
-          const { data: reviews } = await octokit.pulls.listReviews({
-            owner: repo.owner.login,
-            repo: repo.name,
-            pull_number: pr.number,
-            per_page: 100,
-          });
-          totalReviews += reviews.length;
-
-          // Record review dates for active days
-          reviews.forEach(review => {
-            if (review.submitted_at) {
-              const date = new Date(review.submitted_at);
-              if (date.getFullYear() === new Date().getFullYear()) {
-                const dayKey = date.toLocaleDateString('en-US', { weekday: 'long' });
-                activeDaysSet.add(date.toISOString());
-                dailyContributions[dayKey] = (dailyContributions[dayKey] || 0) + 1;
+                stargazerCount
+                owner {
+                  login
+                }
+              }
+              contributions {
+                totalCount
               }
             }
-          });
+            contributionCalendar {
+              totalContributions
+              weeks {
+                contributionDays {
+                  contributionCount
+                  date
+                  weekday
+                }
+              }
+            }
+          }
+          repositories(
+            first: 100, 
+            orderBy: {field: UPDATED_AT, direction: DESC}, 
+            ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]
+          ) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              nameWithOwner
+              isPrivate
+              url
+              description
+              primaryLanguage {
+                name
+              }
+              stargazerCount
+            }
+          }
         }
+      }
+    `);
 
-        repoStats.push({
-          name: repo.name,
-          commits: totalCommits,
-          stars: repo.stargazers_count,
-          url: repo.html_url,
-          description: repo.description,
-          language: repo.language,
-          contributions: totalCommits + comments.length + totalReviews,
-        });
-      } catch (error) {
-        console.error(`Error fetching stats for ${repo.name}:`, error);
-        // Still add the repo with 0 counts
-        repoStats.push({
-          name: repo.name,
-          commits: 0,
-          stars: repo.stargazers_count,
-          url: repo.html_url,
-          description: repo.description,
-          language: repo.language,
-          contributions: 0,
+    // Process daily contributions from the contribution calendar
+    const dailyContributions: Record<string, number> = {};
+    const activeDaysSet = new Set<string>();
+
+    user.contributionsCollection.contributionCalendar.weeks.forEach(
+      (week: any) => {
+        week.contributionDays.forEach((day: any) => {
+          if (day.contributionCount > 0) {
+            const date = new Date(day.date);
+            const dayKey = date.toLocaleDateString("en-US", {
+              weekday: "long",
+            });
+            dailyContributions[dayKey] =
+              (dailyContributions[dayKey] || 0) + day.contributionCount;
+            activeDaysSet.add(day.date);
+          }
         });
       }
-    }
+    );
+
+    // Get total comments and reviews from the GraphQL data
+    const totalComments = user.contributionsCollection.totalIssueContributions;
+    const totalReviews =
+      user.contributionsCollection.totalPullRequestReviewContributions;
+
+    // Calculate total contributions including private repos
+    const allRepoContributions =
+      user.contributionsCollection.totalCommitContributions;
+
+    // Replace the pagination attempt with a manual pagination implementation
+    const login = (await octokit.users.getAuthenticated()).data.login;
+    const allRepositories = await getAllRepositories(graphqlWithAuth, login);
+
+    // Then update the repoStats transformation
+    const repoStats: RepoStats[] = allRepositories.map((repo: any) => ({
+      name: repo.nameWithOwner,
+      commits: repo.defaultBranchRef?.target?.history?.totalCount || 0,
+      stars: repo.stargazerCount,
+      url: repo.url,
+      description: repo.description,
+      language: repo.primaryLanguage?.name || null,
+      contributions: repo.defaultBranchRef?.target?.history?.totalCount || 0,
+      isPrivate: repo.isPrivate,
+    }));
 
     // Aggregate languages
     const languageStats: Record<string, number> = {};
-    repoStats.forEach(repo => {
+    repoStats.forEach((repo) => {
       if (repo.language) {
-        languageStats[repo.language] = (languageStats[repo.language] || 0) + repo.commits;
+        languageStats[repo.language] =
+          (languageStats[repo.language] || 0) + repo.commits;
       }
     });
 
-    const totalLanguageCommits = Object.values(languageStats).reduce((sum, count) => sum + count, 0);
+    const totalLanguageCommits = Object.values(languageStats).reduce(
+      (sum, count) => sum + count,
+      0
+    );
     const languages = Object.entries(languageStats)
       .map(([name, count]) => ({
         name,
-        percentage: (count / totalLanguageCommits) * 100
+        percentage: (count / totalLanguageCommits) * 100,
       }))
       .sort((a, b) => b.percentage - a.percentage);
 
     // Convert daily contributions to sorted array
-    const daysOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-    const contributionsByDay = daysOrder.map(day => ({
+    const daysOrder = [
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday",
+      "Saturday",
+      "Sunday",
+    ];
+    const contributionsByDay = daysOrder.map((day) => ({
       day,
-      count: dailyContributions[day] || 0
+      count: dailyContributions[day] || 0,
     }));
 
     const result = {
       repos: repoStats.sort((a, b) => b.commits - a.commits),
-      totalCommits: repoStats.reduce((sum, repo) => sum + repo.commits, 0),
+      totalCommits: allRepoContributions, // Use total from all repos
       totalComments,
       totalReviews,
-      totalRepos: repoStats.length,
+      totalRepos: repoStats.length, // This remains public repos only
       activeDays: activeDaysSet.size,
       contributionsByDay,
       contributionsByType: [
-        { type: "Commits", count: repoStats.reduce((sum, repo) => sum + repo.commits, 0) },
+        { type: "Commits", count: allRepoContributions }, // Use total from all repos
         { type: "Comments", count: totalComments },
         { type: "Reviews", count: totalReviews },
       ],
@@ -225,4 +286,4 @@ export async function getGitHubStats(accessToken: string | undefined | null) {
     console.error("Error fetching GitHub stats:", error);
     throw error;
   }
-} 
+}
